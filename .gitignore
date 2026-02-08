@@ -2,8 +2,6 @@
 
 # dependencies
 node_modules/
-!node_modules/react-native-audio-api/
-!node_modules/react-native-audio-api/**
 
 # Expo
 .expo/
