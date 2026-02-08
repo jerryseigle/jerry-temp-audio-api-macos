@@ -1,0 +1,144 @@
+require File.join(File.dirname(`node --print "require.resolve('expo/package.json')"`), "scripts/autolinking")
+require File.join(File.dirname(`node --print "require.resolve('react-native/package.json')"`), "scripts/react_native_pods")
+
+require 'json'
+require 'pathname'
+podfile_properties = JSON.parse(File.read(File.join(__dir__, 'Podfile.properties.json'))) rescue {}
+
+def ccache_enabled?(podfile_properties)
+  # Environment variable takes precedence
+  return ENV['USE_CCACHE'] == '1' if ENV['USE_CCACHE']
+  
+  # Fall back to Podfile properties
+  podfile_properties['apple.ccacheEnabled'] == 'true'
+end
+
+ENV['EX_DEV_CLIENT_NETWORK_INSPECTOR'] ||= podfile_properties['EX_DEV_CLIENT_NETWORK_INSPECTOR']
+# Force React Native to build from source for Catalyst stability.
+ENV['RCT_NEW_ARCH_ENABLED'] = '1'
+ENV['RCT_USE_PREBUILT_RNCORE'] = '0'
+ENV['RCT_USE_RN_DEP'] = '0'
+ENV['RCT_BUILD_FROM_SOURCE'] = '1'
+# TEMP: Disable FFmpeg in react-native-audio-api to allow Mac Catalyst builds.
+ENV['DISABLE_AUDIOAPI_FFMPEG'] = '1'
+platform :ios, podfile_properties['ios.deploymentTarget'] || '15.1'
+
+prepare_react_native_project!
+
+target 'audioman' do
+  use_expo_modules!
+
+  if ENV['EXPO_USE_COMMUNITY_AUTOLINKING'] == '1'
+    config_command = ['node', '-e', "process.argv=['', '', 'config'];require('@react-native-community/cli').run()"];
+  else
+    config_command = [
+      'node',
+      '--no-warnings',
+      '--eval',
+      'require(\'expo/bin/autolinking\')',
+      'expo-modules-autolinking',
+      'react-native-config',
+      '--json',
+      '--platform',
+      'ios'
+    ]
+  end
+
+  config = use_native_modules!(config_command)
+
+  # Static linkage is required for Catalyst stability.
+  use_frameworks! :linkage => :static
+
+  use_react_native!(
+    :path => config[:reactNativePath],
+    :hermes_enabled => podfile_properties['expo.jsEngine'] == nil || podfile_properties['expo.jsEngine'] == 'hermes',
+    # An absolute path to your application root.
+    :app_path => "#{Pod::Config.instance.installation_root}/..",
+    :privacy_file_aggregation_enabled => podfile_properties['apple.privacyManifestAggregationEnabled'] != 'false',
+  )
+
+  post_install do |installer|
+    react_native_post_install(
+      installer,
+      config[:reactNativePath],
+      :mac_catalyst_enabled => true,
+      :ccache_enabled => ccache_enabled?(podfile_properties),
+    )
+
+    # Ensure RN/React targets are built as static libs for Catalyst.
+    installer.pods_project.targets.each do |target|
+      if target.name =~ /React|RCT|Yoga|hermes|cxxreact/i
+        target.build_configurations.each do |config|
+          config.build_settings['MACH_O_TYPE'] = 'staticlib'
+          config.build_settings['SKIP_INSTALL'] = 'NO'
+        end
+      end
+    end
+
+    # Remove audio-api force_load static libs when building for Mac Catalyst.
+    installer.pods_project.targets.each do |pod_target|
+      next unless ['RNAudioAPI', 'Pods-audioman'].include?(pod_target.name)
+      pod_target.build_configurations.each do |config|
+        config.build_settings['OTHER_LDFLAGS[sdk=macosx*]'] = '$(inherited)'
+      end
+    end
+
+    # Also patch the generated xcconfig files directly to ensure the override applies.
+    def add_maccatalyst_ldflags_override(path)
+      return unless File.exist?(path)
+      content = File.read(path)
+      return if content.include?('OTHER_LDFLAGS[sdk=macosx*]')
+      File.write(path, "#{content}\nOTHER_LDFLAGS[sdk=macosx*] = $(inherited)\n")
+    end
+
+    def rewrite_audioapi_force_loads_for_macosx(path)
+      return unless File.exist?(path)
+      content = File.read(path)
+
+      ld_line = content.lines.find { |line| line.start_with?('OTHER_LDFLAGS = ') }
+      return unless ld_line && ld_line.include?('external/$(PLATFORM_NAME)/lib')
+
+      full = ld_line.sub('OTHER_LDFLAGS = ', '').strip
+      tokens = full.split(/\s+/)
+      force_tokens = []
+      common_tokens = []
+
+      i = 0
+      while i < tokens.length
+        if tokens[i] == '-force_load' && tokens[i + 1]&.include?('external/$(PLATFORM_NAME)/lib')
+          force_tokens << tokens[i] << tokens[i + 1]
+          i += 2
+        else
+          common_tokens << tokens[i]
+          i += 1
+        end
+      end
+
+      common_line = "OTHER_LDFLAGS = #{common_tokens.join(' ')}"
+      ios_line = "OTHER_LDFLAGS[sdk=iphoneos*] = #{(common_tokens + force_tokens).join(' ')}"
+      sim_line = "OTHER_LDFLAGS[sdk=iphonesimulator*] = #{(common_tokens + force_tokens).join(' ')}"
+      mac_line = "OTHER_LDFLAGS[sdk=macosx*] = #{common_tokens.join(' ')}"
+
+      filtered = content.lines.reject do |line|
+        line.start_with?('OTHER_LDFLAGS[sdk=iphoneos*]') ||
+          line.start_with?('OTHER_LDFLAGS[sdk=iphonesimulator*]') ||
+          line.start_with?('OTHER_LDFLAGS[sdk=macosx*]')
+      end.join
+
+      filtered = filtered.sub(ld_line, "#{common_line}\n")
+      filtered << "\n#{ios_line}\n#{sim_line}\n#{mac_line}\n"
+      File.write(path, filtered)
+    end
+
+    support_dir = File.join(installer.sandbox.root.to_s, 'Target Support Files')
+    add_maccatalyst_ldflags_override(File.join(support_dir, 'Pods-audioman', 'Pods-audioman.debug.xcconfig'))
+    add_maccatalyst_ldflags_override(File.join(support_dir, 'Pods-audioman', 'Pods-audioman.release.xcconfig'))
+    add_maccatalyst_ldflags_override(File.join(support_dir, 'RNAudioAPI', 'RNAudioAPI.debug.xcconfig'))
+    add_maccatalyst_ldflags_override(File.join(support_dir, 'RNAudioAPI', 'RNAudioAPI.release.xcconfig'))
+
+    rewrite_audioapi_force_loads_for_macosx(File.join(support_dir, 'Pods-audioman', 'Pods-audioman.debug.xcconfig'))
+    rewrite_audioapi_force_loads_for_macosx(File.join(support_dir, 'Pods-audioman', 'Pods-audioman.release.xcconfig'))
+    rewrite_audioapi_force_loads_for_macosx(File.join(support_dir, 'RNAudioAPI', 'RNAudioAPI.debug.xcconfig'))
+    rewrite_audioapi_force_loads_for_macosx(File.join(support_dir, 'RNAudioAPI', 'RNAudioAPI.release.xcconfig'))
+  end
+end
